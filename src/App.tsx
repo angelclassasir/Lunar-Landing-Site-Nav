@@ -97,7 +97,7 @@ export default function App() {
           </div>
           <div>
             <h1>Vi@bility42</h1>
-            <p>Lunar Landing Site Navigator</p>
+            <p>Lunar mission atlas · Surface light &amp; communications</p>
           </div>
         </div>
         <div className="topbar-meta">
@@ -131,7 +131,7 @@ export default function App() {
             />
             <span className="mono">{mastHeightM} m</span>
           </label>
-          <span className="pill">NASA Space Apps Challenge 2026</span>
+          <span className="pill" title="Independent NASA Space Apps Challenge project; not an official NASA product">NASA Space Apps · Independent project</span>
         </div>
       </header>
 
@@ -151,6 +151,8 @@ export default function App() {
           onSiteChange={setSite}
           day={day}
           onDayChange={setDay}
+          minutesOfDay={minutesOfDay}
+          onMinutesChange={setMinutesOfDay}
           t={t}
           horizonFor={horizonFor}
         />

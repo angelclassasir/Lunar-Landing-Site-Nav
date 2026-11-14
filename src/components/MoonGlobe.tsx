@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import * as THREE from 'three'
+import { nearbyAlternatives, type Alternative } from '../lib/astro/globeMarkers'
 import { lunarVector, vectorToLatLon, yawToFaceLon } from '../lib/astro/globeMath'
 import type { LunarSite } from '../lib/astro/types'
 
@@ -7,19 +8,53 @@ interface Props {
   sites: LunarSite[]
   selected: LunarSite | null
   onPick: (lat: number, lon: number) => void
+  /** DOM markers with info cards instead of relying only on canvas dots. */
+  richMarkers?: boolean
+  /** Nearby alternatives are shown while a site is selected. */
+  focused?: boolean
+  /** Called when an alternative (marker or row) is chosen. */
+  onSelectSite?: (site: LunarSite) => void
 }
+
+/** Every user-facing string of the globe overlay, in one place. */
+const TEXT = {
+  group: 'Nearby landing sites',
+  selected: (name: string) => `${name}, selected site`,
+  alternative: (index: number, name: string, km: number) =>
+    `${index}. ${name}, ${km} km away`,
+  distance: (km: number, selectedName: string) => `${km} km from ${selectedName}`,
+  alternatives: 'Nearby sites',
+  row: (index: number, name: string, km: number) => `${index} · ${name} · ${km} km`,
+} as const
 
 const DEG = 180 / Math.PI
 const RAD = Math.PI / 180
 const RADIUS = 1
 const PITCH_LIMIT = 80 * RAD
 const CLICK_SLOP_PX = 5
+/** A click this close to an alternative square selects it. */
+const ALTERNATIVE_HIT_PX = 10
 const DRAG_RAD_PER_PX = 0.006
 /** A newly selected site farther than this from the view centre is rotated in. */
 const FOCUS_MAX_DEG = 40
 /** Keep polar sites off the limb instead of showing them edge-on. */
 const FOCUS_PITCH_LIMIT = 35 * RAD
 const FOCUS_MS = 400
+
+interface OverlayMarker {
+  key: string
+  site: LunarSite
+  kind: 'selected' | 'alternative'
+  index: number
+  km?: number
+}
+
+interface AltHit {
+  site: LunarSite
+  x: number
+  y: number
+  index: number
+}
 
 /** Equirectangular grey Moon: maria plus a few hundred craters, fixed seed. */
 function makeMoonTexture(): THREE.CanvasTexture {
@@ -72,15 +107,103 @@ function makeMoonTexture(): THREE.CanvasTexture {
   return texture
 }
 
-export default function MoonGlobe({ sites, selected, onPick }: Props) {
+export default function MoonGlobe({
+  sites,
+  selected,
+  onPick,
+  richMarkers = false,
+  focused = false,
+  onSelectSite,
+}: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const markersRef = useRef<(list: LunarSite[], selectedId: string | null) => void>(() => {})
   const focusRef = useRef<(site: LunarSite) => void>(() => {})
   const pickRef = useRef(onPick)
+  const selectRef = useRef(onSelectSite)
+
+  // Screen positions of the alternative squares, for the 10 px hit test.
+  const altHitRef = useRef<AltHit[]>([])
+  const markerEls = useRef(new Map<string, HTMLDivElement>())
+  const selectedCardRef = useRef<HTMLDivElement>(null)
+  const projectRef = useRef<((lat: number, lon: number) => { x: number; y: number; front: boolean }) | null>(null)
+  const layoutRef = useRef<() => void>(() => {})
+
+  const alternatives = useMemo<Alternative[]>(
+    () => (richMarkers && focused && selected ? nearbyAlternatives(selected, sites) : []),
+    [richMarkers, focused, selected, sites],
+  )
+
+  const overlay = useMemo<OverlayMarker[]>(() => {
+    if (!richMarkers || !focused || !selected) return []
+    return [
+      { key: 'selected', site: selected, kind: 'selected', index: 0 },
+      ...alternatives.map((alternative, index) => ({
+        key: alternative.site.id,
+        site: alternative.site,
+        kind: 'alternative' as const,
+        index: index + 1,
+        km: alternative.km,
+      })),
+    ]
+  }, [richMarkers, focused, selected, alternatives])
+
+  const overlayRef = useRef(overlay)
+  overlayRef.current = overlay
+
+  // Place the DOM markers over the canvas. Called after every three.js render
+  // (and after each React render, so a new selection appears immediately).
+  layoutRef.current = () => {
+    const host = hostRef.current
+    const project = projectRef.current
+    if (!host || !project) return
+    const width = host.clientWidth
+    const height = host.clientHeight
+    if (width === 0 || height === 0) return
+
+    const hits: AltHit[] = []
+    let selectedPoint: { x: number; y: number; front: boolean } | null = null
+
+    for (const marker of overlayRef.current) {
+      const element = markerEls.current.get(marker.key)
+      if (!element) continue
+      const point = project(marker.site.lat, marker.site.lon)
+      const visible =
+        point.front && point.x > 0.01 && point.x < 0.99 && point.y > 0.01 && point.y < 0.99
+      const x = point.x * width
+      const y = point.y * height
+      element.style.visibility = visible ? 'visible' : 'hidden'
+      element.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0)`
+      element.classList.toggle('is-flipped-x', point.x > 0.58)
+      element.classList.toggle('is-flipped-y', point.y > 0.7)
+      if (marker.kind === 'selected') selectedPoint = { x, y, front: visible }
+      else if (visible) hits.push({ site: marker.site, x, y, index: marker.index })
+    }
+    altHitRef.current = hits
+
+    const card = selectedCardRef.current
+    if (card) {
+      const show = selectedPoint !== null && selectedPoint.front && hits.length > 0
+      card.style.visibility = show ? 'visible' : 'hidden'
+      if (selectedPoint && show) {
+        card.style.left = `${selectedPoint.x.toFixed(1)}px`
+        card.style.top = `${selectedPoint.y.toFixed(1)}px`
+        card.classList.toggle('is-flipped-x', selectedPoint.x > 0.55)
+        card.classList.toggle('is-flipped-y', selectedPoint.y > 0.68)
+      }
+    }
+  }
+
+  useEffect(() => {
+    layoutRef.current()
+  })
 
   useEffect(() => {
     pickRef.current = onPick
   }, [onPick])
+
+  useEffect(() => {
+    selectRef.current = onSelectSite
+  }, [onSelectSite])
 
   useEffect(() => {
     const host = hostRef.current
@@ -196,10 +319,31 @@ export default function MoonGlobe({ sites, selected, onPick }: Props) {
       dirty = false
       orbit.rotation.set(pitch.current, yaw.current, 0)
       renderer.render(scene, camera)
+      layoutRef.current()
     }
     // Apply the initial view even if the first animation frame is delayed.
     orbit.rotation.set(pitch.current, yaw.current, 0)
     raf = requestAnimationFrame(draw)
+
+    // Project a selenographic point to CSS pixels over the canvas. Same scene
+    // graph order as the render, so the DOM markers track drags and zooms.
+    projectRef.current = (lat, lon) => {
+      scene.updateMatrixWorld(true)
+      camera.updateMatrixWorld()
+      const local = lunarVector(lat, lon, RADIUS * 1.006)
+      const world = globe.localToWorld(new THREE.Vector3(local.x, local.y, local.z))
+      const ndc = world.clone().project(camera)
+      const radial = world.clone().normalize()
+      const toCamera = camera.position.clone().sub(world).normalize()
+      return {
+        x: (ndc.x + 1) / 2,
+        y: (1 - ndc.y) / 2,
+        // Slightly biased so a marker right on the limb stays hidden.
+        front: radial.dot(toCamera) > 0.02,
+      }
+    }
+    // Place the DOM markers before the first animation frame too.
+    layoutRef.current()
 
     // Real map: public/moon.jpg (NASA SVS, 2048x1024, longitude 0 at centre,
     // north up). The procedural texture paints the globe until it arrives and
@@ -298,7 +442,13 @@ export default function MoonGlobe({ sites, selected, onPick }: Props) {
     let moved = 0
     let lastX = 0
     let lastY = 0
+    // Marker buttons and their cards handle their own clicks; a drag or a
+    // map pick must not start from them.
+    const fromOverlay = (event: PointerEvent) =>
+      event.target instanceof Element &&
+      Boolean(event.target.closest('.globe-marker, .globe-marker-card'))
     const onPointerDown = (event: PointerEvent) => {
+      if (fromOverlay(event)) return
       // A drag takes over from any in-flight focus animation.
       anim.active = false
       dragging = true
@@ -328,7 +478,25 @@ export default function MoonGlobe({ sites, selected, onPick }: Props) {
       dragging = false
       host.classList.remove('dragging')
       if (host.hasPointerCapture(event.pointerId)) host.releasePointerCapture(event.pointerId)
-      if (moved < CLICK_SLOP_PX) pickAt(event.clientX, event.clientY)
+      if (moved >= CLICK_SLOP_PX) return
+      const rect = host.getBoundingClientRect()
+      const x = event.clientX - rect.left
+      const y = event.clientY - rect.top
+      let best: AltHit | null = null
+      let bestDistance = ALTERNATIVE_HIT_PX
+      for (const hit of altHitRef.current) {
+        const distance = Math.hypot(hit.x - x, hit.y - y)
+        if (distance > ALTERNATIVE_HIT_PX) continue
+        if (best === null || distance < bestDistance || (distance === bestDistance && hit.index < best.index)) {
+          best = hit
+          bestDistance = distance
+        }
+      }
+      if (best) {
+        selectRef.current?.(best.site)
+        return
+      }
+      pickAt(event.clientX, event.clientY)
     }
     host.addEventListener('pointerdown', onPointerDown)
     host.addEventListener('pointermove', onPointerMove)
@@ -378,6 +546,8 @@ export default function MoonGlobe({ sites, selected, onPick }: Props) {
       host.removeEventListener('wheel', onWheel)
       markersRef.current = () => {}
       focusRef.current = () => {}
+      projectRef.current = null
+      altHitRef.current = []
       markers.geometry.dispose()
       markers.material.dispose()
       markers.parent?.remove(markers)
@@ -395,11 +565,84 @@ export default function MoonGlobe({ sites, selected, onPick }: Props) {
   }, [])
 
   useEffect(() => {
+    // In rich focused mode the selection and its alternatives are drawn as DOM
+    // buttons; keeping their canvas dots would show a duplicate underneath.
+    const hidden = new Set(overlay.map((marker) => marker.site.id))
     // Custom picks are not part of the curated list; keep their marker visible.
-    const list = selected && !sites.some((s) => s.id === selected.id) ? [...sites, selected] : sites
+    const list = (selected && !sites.some((s) => s.id === selected.id) ? [...sites, selected] : sites)
+      .filter((site) => overlay.length === 0 || !hidden.has(site.id))
     markersRef.current(list, selected?.id ?? null)
     if (selected) focusRef.current(selected)
-  }, [sites, selected])
+    layoutRef.current()
+  }, [sites, selected, overlay])
 
-  return <div className="moon-globe" ref={hostRef} />
+  return (
+    <div className="moon-globe" ref={hostRef}>
+      {overlay.length > 0 && (
+        <div className="globe-markers" role="group" aria-label={TEXT.group}>
+          {overlay.map((marker) => (
+            <div
+              key={marker.key}
+              ref={(element) => {
+                if (element) markerEls.current.set(marker.key, element)
+                else markerEls.current.delete(marker.key)
+              }}
+              className={`globe-marker globe-marker--${marker.kind}`}
+            >
+              <button
+                type="button"
+                className={`globe-marker__hit globe-marker__hit--${marker.kind}`}
+                aria-label={
+                  marker.kind === 'selected'
+                    ? TEXT.selected(marker.site.name)
+                    : TEXT.alternative(marker.index, marker.site.name, marker.km ?? 0)
+                }
+                onClick={() => {
+                  if (marker.kind === 'alternative') onSelectSite?.(marker.site)
+                }}
+              >
+                {marker.kind === 'selected' ? (
+                  <span className="globe-marker__dot" aria-hidden="true" />
+                ) : (
+                  marker.index
+                )}
+              </button>
+              {marker.kind === 'alternative' && marker.km !== undefined && (
+                <div className="globe-marker-card" role="group">
+                  <strong>{marker.site.name}</strong>
+                  <span>{TEXT.distance(marker.km, selected?.name ?? '')}</span>
+                </div>
+              )}
+            </div>
+          ))}
+
+          {selected && alternatives.length > 0 && (
+            <div
+              className="globe-marker-card globe-marker-card--selected"
+              ref={selectedCardRef}
+              role="group"
+              aria-label={TEXT.alternatives}
+            >
+              <strong>{selected.name}</strong>
+              {selected.note && <span>{selected.note}</span>}
+              <p className="globe-marker-heading">{TEXT.alternatives}</p>
+              <ol className="globe-alt-list">
+                {alternatives.map((alternative, index) => (
+                  <li key={alternative.site.id}>
+                    <button
+                      type="button"
+                      className="globe-alt-row"
+                      onClick={() => onSelectSite?.(alternative.site)}
+                    >
+                      {TEXT.row(index + 1, alternative.site.name, alternative.km)}
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
 }

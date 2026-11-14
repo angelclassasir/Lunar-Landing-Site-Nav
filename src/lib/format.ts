@@ -9,6 +9,21 @@ export function formatDuration(ms: number): string {
   return `${m}m`
 }
 
+/**
+ * Coarse, readable span for visibility-cycle copy, floored to whole minutes:
+ * "3 d 4 h", "5 h 20 min" or "40 min".
+ */
+export function formatSpan(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0 min'
+  const totalMin = Math.floor(ms / 60_000)
+  const d = Math.floor(totalMin / 1440)
+  const h = Math.floor((totalMin % 1440) / 60)
+  const m = totalMin % 60
+  if (d > 0) return `${d} d ${h} h`
+  if (h > 0) return `${h} h ${m} min`
+  return `${m} min`
+}
+
 const pad = (n: number) => String(n).padStart(2, '0')
 
 const MONTHS = [
@@ -82,6 +97,14 @@ export function formatMonthDay(t: number): string {
 export function formatMonthYear(t: number): string {
   const d = new Date(t)
   return `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`
+}
+
+/** "Nov 13 20:46" in UTC, for pass transitions. */
+export function formatMonthDayTime(t: number): string {
+  const d = new Date(t)
+  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()} ${pad(d.getUTCHours())}:${pad(
+    d.getUTCMinutes(),
+  )}`
 }
 
 /** "Nov 13 2026 · 12:00 UTC". */

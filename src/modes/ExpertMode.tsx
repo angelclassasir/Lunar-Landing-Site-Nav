@@ -4,6 +4,10 @@ import RankingTable from '../components/RankingTable'
 import OpportunityPanel from '../components/OpportunityPanel'
 import SkyView from '../components/SkyView'
 import MoonGlobe from '../components/MoonGlobe'
+import TimeScrubber from '../components/TimeScrubber'
+import VisibilityCycle from '../components/VisibilityCycle'
+import { useScrubber } from '../hooks/useScrubber'
+import { usePassPeriods } from '../hooks/usePassPeriods'
 import { buildTimeline } from '../lib/astro/timeline'
 import { rankSites, type RankSortKey, type RankedSite } from '../lib/astro/ranking'
 import { bestFixedPanel, compassPoint16 } from '../lib/astro/panel'
@@ -20,6 +24,9 @@ export interface ExpertModeProps {
   /** Shared day, 'YYYY-MM-DD' UTC */
   day: string
   onDayChange: (day: string) => void
+  /** Minutes after midnight UTC, 0..1435 */
+  minutesOfDay: number
+  onMinutesChange: (minutes: number) => void
   /** Shared instant from the Explorer; used when the timeline is not hovered */
   t: number
   /** Attach the terrain skyline to a site (no-op while the grid is loading) */
@@ -49,6 +56,7 @@ export default function ExpertMode({
   onSiteChange,
   day,
   onDayChange,
+  onMinutesChange,
   t,
   horizonFor,
 }: ExpertModeProps) {
@@ -62,6 +70,21 @@ export default function ExpertMode({
   const [view, setView] = useState<'single' | 'rank' | 'find'>('single')
   const [sortBy, setSortBy] = useState<RankSortKey>('jointPct')
 
+  // The shared clock moves with the scrubber, but the analysis range does not:
+  // it is fixed by Start (UTC) so playing or dragging past midnight never
+  // rebuilds the timeline, the ranking or the mission calendar.
+  const [rangeDay, setRangeDay] = useState(day)
+  const scrubber = useScrubber({ site, day, onDayChange, onMinutesChange, t })
+  // Visibility periods follow the scrubber's own window, not the analysis
+  // range: the Now column has to agree with the clock and the sky view.
+  const passes = usePassPeriods(site, scrubber.windowStart)
+
+  // Playback should move the sky view; a moment pinned on the chart would
+  // freeze it, so starting Play releases the pin.
+  useEffect(() => {
+    if (scrubber.playing) setPinned(null)
+  }, [scrubber.playing])
+
   // Only decorate the shortlist when the ranking or the calendar is open: each
   // profile marches a few hundred thousand grid samples, and the single-site
   // view already carries its own.
@@ -70,7 +93,7 @@ export default function ExpertMode({
     [view, horizonFor],
   )
 
-  const parsedStart = Date.parse(`${day}T00:00:00Z`)
+  const parsedStart = Date.parse(`${rangeDay}T00:00:00Z`)
   const t0 = Number.isFinite(parsedStart) ? parsedStart : Date.parse('2028-01-01T00:00:00Z')
   const t1 = t0 + days * DAY
 
@@ -166,6 +189,14 @@ export default function ExpertMode({
 
   return (
     <>
+      <section className="atlas-intro expert-intro" aria-labelledby="analysis-title">
+        <div>
+          <p className="atlas-kicker">LUNAR SURFACE OPERATIONS <span>·</span> ANALYSIS</p>
+          <h2 id="analysis-title">Compare the conditions.<br /><em>Choose the window.</em></h2>
+          <p className="atlas-deck">A shared site and UTC time drive every timeline, score and visibility result below.</p>
+        </div>
+        <p className="atlas-index"><span>01</span> SITE CONDITIONS<br /><span>02</span> MISSION WINDOW</p>
+      </section>
       <section className="controls">
         <div className="field">
           <span>View</span>
@@ -212,7 +243,14 @@ export default function ExpertMode({
 
         <label className="field">
           <span>Start (UTC)</span>
-          <input type="date" value={day} onChange={(e) => onDayChange(e.target.value)} />
+          <input
+            type="date"
+            value={rangeDay}
+            onChange={(e) => {
+              setRangeDay(e.target.value)
+              scrubber.pickDay(e.target.value)
+            }}
+          />
         </label>
 
         <div className="field">
@@ -309,6 +347,14 @@ export default function ExpertMode({
               tone="muted"
             />
           </section>
+
+          <VisibilityCycle
+            variant="expert"
+            t={t}
+            sun={passes.sun}
+            earth={passes.earth}
+            both={passes.both}
+          />
 
           <section className="chart-card panel-card">
             <div className="chart-head">
@@ -466,6 +512,18 @@ export default function ExpertMode({
               }
             />
           </section>
+
+          <section className="chart-card simulator-card" aria-labelledby="simulator-title">
+            <div className="chart-head">
+              <div>
+                <h2 id="simulator-title">Simulator</h2>
+                <p>Move the clock: the sky view and the globe follow it.</p>
+              </div>
+            </div>
+            <div className="simulator-body">
+              <TimeScrubber scrubber={scrubber} t={t} day={day} />
+            </div>
+          </section>
         </>
       ) : view === 'rank' ? (
         <section className="chart-card ranking-card">
@@ -501,8 +559,10 @@ export default function ExpertMode({
           t0={t0}
           days={days}
           onOpen={(next, start) => {
+            const nextDay = utcDay(start)
             onSiteChange(next)
-            onDayChange(utcDay(start))
+            setRangeDay(nextDay)
+            scrubber.pickDay(nextDay)
             setView('single')
           }}
         />

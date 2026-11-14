@@ -1,26 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo } from 'react'
 import MissionPlanner from '../components/MissionPlanner'
 import MoonGlobe from '../components/MoonGlobe'
 import SkyView from '../components/SkyView'
 import ArrayCard from '../components/ArrayPower'
+import TimeScrubber from '../components/TimeScrubber'
+import VisibilityCycle from '../components/VisibilityCycle'
+import { commitInstant, useScrubber } from '../hooks/useScrubber'
+import { usePassPeriods } from '../hooks/usePassPeriods'
 import { bestFixedPanel, compassPoint16 } from '../lib/astro/panel'
 import { buildTimeline } from '../lib/astro/timeline'
 import { createObserver } from '../lib/astro/observer'
 import { SITES, customSite, isTerrainCritical } from '../lib/astro/sites'
-import {
-  DAY_MS,
-  SCRUB_DAYS,
-  SCRUB_MAX_MIN,
-  SCRUB_SPAN_MS,
-  minutesOfDayUtc,
-  sliderMinutesToTime,
-  timeToSliderMinutes,
-  utcDay,
-  utcDayStart,
-  windowPercent,
-} from '../lib/astro/scrub'
-import type { HorizonProfile, LunarSite, TimeWindow } from '../lib/astro/types'
-import { formatCoord, formatHours, formatInstant, formatMonthDay, formatUtc } from '../lib/format'
+import { DAY_MS } from '../lib/astro/scrub'
+import type { HorizonProfile, LunarSite } from '../lib/astro/types'
+import { formatCoord, formatHours, formatUtc } from '../lib/format'
 
 export interface ExplorerModeProps {
   site: LunarSite
@@ -37,11 +30,6 @@ export interface ExplorerModeProps {
 
 const RAD = Math.PI / 180
 const NEAR_SITE_DEG = 3
-/** Playback speed: three simulated hours every 80 ms. */
-const PLAY_STEP_MS = 3 * 3_600_000
-const PLAY_INTERVAL_MS = 80
-/** Date tick every five days, including both window ends. */
-const TICK_OFFSET_DAYS = Array.from({ length: SCRUB_DAYS / 5 + 1 }, (_, i) => i * 5)
 
 /** Sun icon: disc with rays. */
 function SunIcon() {
@@ -74,16 +62,6 @@ function angularDistanceDeg(a: LunarSite, b: LunarSite): number {
   return Math.acos(Math.min(1, Math.max(-1, cosine))) / RAD
 }
 
-/** Move the shared instant through the same day/minutes pair the date input uses. */
-function commitInstant(
-  next: number,
-  onDayChange: (day: string) => void,
-  onMinutesChange: (minutes: number) => void,
-) {
-  onDayChange(utcDay(next))
-  onMinutesChange(minutesOfDayUtc(next, 1))
-}
-
 export default function ExplorerMode({
   site,
   onSiteChange,
@@ -102,58 +80,14 @@ export default function ExplorerMode({
     [site, dayStart],
   )
 
-  // The scrub window is local: a date picked elsewhere recentres it, but the
-  // shared instant only ever moves it when it falls outside.
-  const [windowStart, setWindowStart] = useState(() => {
-    const start = Date.parse(`${day}T00:00:00Z`)
-    return Number.isFinite(start) ? start : utcDayStart(Date.now())
-  })
-  const windowEnd = windowStart + SCRUB_SPAN_MS
-  // 30 days at 1 h resolution: independent of the playhead, so dragging and
-  // playing never rebuild it.
-  const cycle = useMemo(
-    () => buildTimeline(site, windowStart, windowEnd, 3_600_000),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [site, windowStart],
-  )
+  const scrubber = useScrubber({ site, day, onDayChange, onMinutesChange, t })
+  const { windowEnd, cycle, setPlaying } = scrubber
+  // Hourly periods over the 60-day look-ahead: rebuilt only when the site or
+  // the scrub window moves, never on scrub.
+  const passes = usePassPeriods(site, scrubber.windowStart)
 
   // Best fixed panel over the 30-day window (shared model with Expert mode).
   const fixedPanel = useMemo(() => bestFixedPanel(cycle.samples), [cycle])
-
-  const [playing, setPlaying] = useState(false)
-  const [loop, setLoop] = useState(true)
-  // The interval must read the latest instant without restarting every tick.
-  const tRef = useRef(t)
-  useEffect(() => {
-    tRef.current = t
-  }, [t])
-
-  // A new site is a new question: stop the playback.
-  useEffect(() => {
-    setPlaying(false)
-  }, [site.id, site.lat, site.lon])
-
-  // Date input or any other external jump out of the window: recentre on it.
-  useEffect(() => {
-    if (t < windowStart || t > windowEnd) setWindowStart(utcDayStart(t))
-  }, [t, windowStart, windowEnd])
-
-  useEffect(() => {
-    if (!playing) return
-    const timer = setInterval(() => {
-      let next = tRef.current + PLAY_STEP_MS
-      if (next >= windowEnd) {
-        if (loop) {
-          next = windowStart
-        } else {
-          next = windowEnd
-          setPlaying(false)
-        }
-      }
-      commitInstant(next, onDayChange, onMinutesChange)
-    }, PLAY_INTERVAL_MS)
-    return () => clearInterval(timer)
-  }, [playing, loop, windowStart, windowEnd, onDayChange, onMinutesChange])
 
   const nearest = useMemo(() => {
     let best: { site: LunarSite; distance: number } | null = null
@@ -163,36 +97,6 @@ export default function ExplorerMode({
     }
     return best && best.distance <= NEAR_SITE_DEG ? best.site : null
   }, [site])
-
-  const shiftDay = (deltaDays: number) => {
-    const base = Number.isFinite(dayStart) ? dayStart : Date.now()
-    onDayChange(new Date(base + deltaDays * DAY_MS).toISOString().slice(0, 10))
-  }
-
-  const pickDay = (next: string) => {
-    const nextStart = Date.parse(`${next}T00:00:00Z`)
-    if (!Number.isFinite(nextStart)) return
-    setPlaying(false)
-    setWindowStart(nextStart)
-    onDayChange(next)
-  }
-
-  const scrubValue = timeToSliderMinutes(windowStart, t)
-  const scrubTo = (value: number) => {
-    commitInstant(sliderMinutesToTime(windowStart, value), onDayChange, onMinutesChange)
-  }
-
-  const segments = (windows: TimeWindow[], tone: 'sun' | 'earth') =>
-    windows.map((w, i) => (
-      <span
-        key={`${tone}-${i}`}
-        className={`scrub-seg scrub-seg-${tone}`}
-        style={{
-          left: `${windowPercent(windowStart, w.start)}%`,
-          width: `${(w.durationMs / SCRUB_SPAN_MS) * 100}%`,
-        }}
-      />
-    ))
 
   const earthUp = sky.earthVisible
   // A Sun whose centre sits just below the horizon can still be half visible
@@ -213,6 +117,14 @@ export default function ExplorerMode({
 
   return (
     <div className="explorer">
+      <section className="atlas-intro" aria-labelledby="atlas-title">
+        <div>
+          <p className="atlas-kicker">LUNAR SURFACE OPERATIONS <span>·</span> EXPLORER</p>
+          <h2 id="atlas-title">Find the light.<br /><em>Keep Earth in view.</em></h2>
+          <p className="atlas-deck">Compare landing sites against the lunar horizon, sunlight and direct-to-Earth visibility.</p>
+        </div>
+        <p className="atlas-index"><span>01</span> SITE CONDITIONS<br /><span>02</span> MISSION WINDOW</p>
+      </section>
       <section className="controls explorer-site-picker">
         <label className="field">Landing site
           <select value={SITES.some(s => s.id === site.id) ? site.id : 'custom'} onChange={e => {
@@ -230,6 +142,9 @@ export default function ExplorerMode({
           sites={SITES}
           selected={site}
           onPick={(lat, lon) => onSiteChange(customSite(lat, lon))}
+          richMarkers
+          focused={Boolean(site)}
+          onSelectSite={onSiteChange}
         />
         <div className="explorer-picked">
           <strong>{formatCoord(site.lat, site.lon)}</strong>
@@ -257,6 +172,7 @@ export default function ExplorerMode({
                       1,
                     )}° below the horizon, no direct line of sight.`}
             </p>
+            <VisibilityCycle variant="plain" t={t} kind="earth" periods={passes.earth} />
           </div>
         </article>
 
@@ -278,6 +194,7 @@ export default function ExplorerMode({
                   ? 'The Sun is up, but the terrain skyline hides it, so the site is in shadow.'
                   : 'The Sun is below the horizon, so it is night here.'}
             </p>
+            <VisibilityCycle variant="plain" t={t} kind="sun" periods={passes.sun} />
           </div>
         </article>
 
@@ -322,93 +239,7 @@ export default function ExplorerMode({
         onJump={next => { setPlaying(false); commitInstant(next, onDayChange, onMinutesChange) }} />
 
       <section className="controls explorer-controls">
-        <div className="field">
-          <span>Day (UTC)</span>
-          <div className="day-row">
-            <button onClick={() => shiftDay(-1)} aria-label="Previous day">
-              −
-            </button>
-            <input type="date" value={day} onChange={(e) => pickDay(e.target.value)} />
-            <button onClick={() => shiftDay(1)} aria-label="Next day">
-              +
-            </button>
-          </div>
-        </div>
-
-        <div className="field explorer-scrub">
-          <div className="scrub-head">
-            <strong className="scrub-instant">{formatInstant(t)}</strong>
-            <div className="scrub-actions">
-              <button
-                className={`scrub-play${playing ? ' is-playing' : ''}`}
-                onClick={() => setPlaying((value) => !value)}
-                aria-pressed={playing}
-              >
-                {playing ? (
-                  <svg viewBox="0 0 16 16" aria-hidden="true">
-                    <rect x="3.6" y="3" width="3.2" height="10" rx="1.1" />
-                    <rect x="9.2" y="3" width="3.2" height="10" rx="1.1" />
-                  </svg>
-                ) : (
-                  <svg viewBox="0 0 16 16" aria-hidden="true">
-                    <path d="M4.9 2.9 12.8 8l-7.9 5.1Z" />
-                  </svg>
-                )}
-                <span>{playing ? 'Pause' : 'Play'}</span>
-              </button>
-              <label className="scrub-loop">
-                <input type="checkbox" checked={loop} onChange={(e) => setLoop(e.target.checked)} />
-                Loop
-              </label>
-            </div>
-          </div>
-
-          <div className="scrub-grid">
-            <span className="scrub-label">Sun</span>
-            <div className="scrub-track" role="img" aria-label="Sunlight over the next 30 days">
-              {segments(cycle.sunWindows, 'sun')}
-            </div>
-
-            <span className="scrub-label">Earth</span>
-            <div className="scrub-track" role="img" aria-label="Earth visibility over the next 30 days">
-              {segments(cycle.commWindows, 'earth')}
-            </div>
-
-            <span />
-            <div className="scrub-ticks" aria-hidden="true">
-              {TICK_OFFSET_DAYS.map((offsetDays, index) => {
-                const edge =
-                  index === 0
-                    ? ' is-first'
-                    : index === TICK_OFFSET_DAYS.length - 1
-                      ? ' is-last'
-                      : ''
-                return (
-                  <span
-                    key={offsetDays}
-                    className={`scrub-tick${edge}`}
-                    style={{ left: `${(offsetDays / SCRUB_DAYS) * 100}%` }}
-                  >
-                    {formatMonthDay(windowStart + offsetDays * DAY_MS)}
-                  </span>
-                )
-              })}
-            </div>
-
-            <span />
-            <input
-              className="scrub-range"
-              type="range"
-              min={0}
-              max={SCRUB_MAX_MIN}
-              step={1}
-              value={scrubValue}
-              onChange={(e) => scrubTo(Number(e.target.value))}
-              onPointerDown={() => setPlaying(false)}
-              aria-label="Time across the 30-day lunar cycle"
-            />
-          </div>
-        </div>
+        <TimeScrubber scrubber={scrubber} t={t} day={day} />
       </section>
     </div>
   )
